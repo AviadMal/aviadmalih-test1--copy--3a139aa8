@@ -1,0 +1,183 @@
+-------------------------------------------------------------------------
+-- biss_enc_regs: register handling module. 
+-- sw- write the cfg registers, values are passed to fw biss_enc_if module and are sampled on st_idle. 
+-- position data is updated by the biss_enc_if module.
+-- all registers can be read by sw, ENC_POSITION regs are RO
+-- addresses are specified in biss_enc_pkg 
+-------------------------------------------------------------------------
+
+library ieee;
+use ieee.std_logic_1164.all;
+--use ieee.numeric_std.all;
+USE ieee.std_logic_arith.all;
+USE ieee.std_logic_unsigned.all;
+
+library work;
+use work.BISS_ENC_PKG.all;
+
+entity biss_enc_regs is
+generic (
+    G_RESET_ACTIVE_VALUE        : std_logic := '1';                                             -- polarity of reset input
+    G_CLK_FREQ_IN_MHZ           : integer := 0;
+    G_BISS_MAX_DATA_BITS        : integer := 40
+);
+port (
+    RESET                       : in    std_logic;                                              -- global synchronous reset, polarity defined by G_RESET_ACTIVE_VALUE
+    CLK                         : in    std_logic;                                              -- clock input
+    -- output to FW 
+    ENCODER_POSITION            : in    std_logic_vector(G_BISS_MAX_DATA_BITS-1 downto 0);      -- encoder position
+    ENCODER_POSITION_VALID      : in    std_logic;                                              -- active high encoder position valid
+--  ENCODER_ERROR               : in    std_logic;
+--  CRC_ERROR                   : in    std_logic;
+    ENCODER_STATUS              : in    std_logic_vector(7 downto 0);
+    CDS_DATA					: in 	std_logic_vector(7 downto 0);							-- Data from the slave
+    ENCODER_LIFE_POSITION  		: in 	std_logic_vector(5 downto 0);
+    --  FW inputs
+    RESOLUTION                  : out   std_logic_vector(5 downto 0);                           -- encoder resolution
+    MA_TO_CLK_RATIO             : out   std_logic_vector(7 downto 0);                           -- number of input clocks per MA cycle 
+    ACK_TIMEOUT_DELAY           : out   std_logic_vector(7 downto 0);                           -- number of MA cycle to yield 21us dely 
+    END_TIMEOUT_DELAY           : out   std_logic_vector(8 downto 0);                           -- number of MA cycle to yield 40us timeout at end of cycle
+    ENCODER_ENA                 : out   std_logic;
+    CDM_ADDRESS 				: out 	std_logic_vector(6 downto 0);							-- Master address sent	
+    CDM_OPERATION 				: out 	std_logic_vector(1 downto 0);												-- Read /Write operation 
+    CDM_DATA 					: out 	std_logic_vector(7 downto 0);							-- Master data sent out
+    RESET_EN                    : out  std_logic_vector(4 downto 0); -- IN which type of error ,It will enter to reset state (active low)
+    RESET_TIME_STATE            : out  std_logic_vector(15 downto 0); -- reset time at us (MA on high)
+    
+    AV_MM_WRITEDATA             : in    std_logic_vector(31 downto 0);                          -- writedata
+    AV_MM_WRITE                 : in    std_logic;                                              -- write
+    AV_MM_BYTEENABLE            : in    std_logic_vector(3 downto 0);                           -- byteenable
+    
+    AV_MM_WAITREQUEST           : out   std_logic;                                              -- waitrequest
+    AV_MM_READDATA              : out   std_logic_vector(31 downto 0);                          -- readdata
+    AV_MM_READDATAVALID         : out   std_logic;                                              -- readdatavalid
+    AV_MM_ADDRESS               : in    std_logic_vector(C_BISS_ENC_ADDR_WIDTH-1 downto 0);     -- address
+    AV_MM_READ                  : in    std_logic                                               -- read
+);
+end biss_enc_regs;
+
+
+
+architecture biss_enc_regs_arc of biss_enc_regs is
+
+    signal position_h_reg 	        : std_logic_vector(31 downto 0) := (others=>'0'); -- holds the locked value of the low 32 bit of position. locked when C_ENC_POSITION_H_ADDR is read
+    signal data_out_reg   	        : std_logic_vector(31 downto 0) := (others=>'0');
+    signal data_valid_reg               : std_logic := '0';	
+    signal word_address                 : std_logic_vector(C_BISS_ENC_ADDR_WIDTH-2-1 downto 0) := (others=>'0');-- word address
+    signal biss_configuration_reg       : std_logic_vector(31 downto 0) := (others=>'0');
+    signal enc_pos_h_lat_ena            : std_logic := '0';
+    signal control_data_configuration_reg   	: std_logic_vector(31 downto 0) := (others=>'0');
+    signal reset_configuration_reg      : std_logic_vector(31 downto 0) := (others => '0');
+
+    
+begin
+
+--------------------------------------------------------------------------------------------------------------------------------------------------
+--  fw_write_proc: fw updats ENC_POSITION_L and ENC_POSITION_H registers when ENCODER_POSITION_VALID is asserted.
+--  ENC_POSITION_L holds the lower 32 bits of position data
+--  ENC_POSITION_H holds the upper 4 bits of position data (at bits 3:0), crc_err and enc_err at bits 31 and 30.
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+    fw_write_proc : process (CLK , RESET)
+    begin
+        if (RESET = G_RESET_ACTIVE_VALUE) then
+        	biss_configuration_reg <= (others=>'0');
+        	control_data_configuration_reg<=(others=>'0');
+        	reset_configuration_reg <=(others=>'0');
+        	reset_configuration_reg(23 downto 8) <=x"07D0";
+        	
+        elsif rising_edge (CLK) then
+
+            if (AV_MM_WRITE = '1') then
+                if (word_address = 0) then                                                              -- make sure addr is inside address space
+                    for i in 0 to 3 loop
+                        if (AV_MM_BYTEENABLE(i) = '1') then
+                            biss_configuration_reg((i+1)*8-1 downto i*8) <= AV_MM_WRITEDATA((i+1)*8-1 downto i*8);
+                        end if;
+                    end loop;                  
+                elsif (word_address = 4)  then                                                              -- make sure addr is inside address space
+                    for i in 0 to 3 loop
+                        if (AV_MM_BYTEENABLE(i) = '1') then
+                            control_data_configuration_reg((i+1)*8-1 downto i*8) <= AV_MM_WRITEDATA((i+1)*8-1 downto i*8);
+                        end if;
+                    end loop;    
+                elsif (word_address = 5)  then                                                              -- make sure addr is inside address space
+                    for i in 0 to 3 loop
+                        if (AV_MM_BYTEENABLE(i) = '1') then
+                            reset_configuration_reg((i+1)*8-1 downto i*8) <= AV_MM_WRITEDATA((i+1)*8-1 downto i*8);
+                        end if;
+                    end loop;                
+                end if;
+            end if;
+
+        end if;	
+    end process;
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--  sw_read_proc: register read by sw. i.e -> when a the sw wants to read the registers it initiate the read protocol to the upper level which will assert the regbus_rd.
+--  the fw will set the correct value of the register on the REGBUS_DATA_OUT signal and set the REGBUS_DATA_OUT_VALID.
+--  register addresses are specified in biss_enc_pkg.
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    sw_read_proc: process(CLK , RESET)    
+    begin       
+        if (RESET = G_RESET_ACTIVE_VALUE ) then
+            position_h_reg <= (others => '0');
+            data_out_reg <= (others => '0');
+            data_valid_reg <= '0';
+            enc_pos_h_lat_ena <= '0';
+        elsif rising_edge (CLK) then
+            if (AV_MM_READ = '1') then
+                data_valid_reg <= '1';
+            
+                if (word_address = 0) then
+                    data_out_reg <= biss_configuration_reg;
+                elsif (word_address = 1) then
+                    data_out_reg <= C_ZEROS(31 downto 10) & conv_std_logic_vector(G_CLK_FREQ_IN_MHZ, 10);
+                elsif (word_address = 2) then
+                    data_out_reg <= ENCODER_POSITION(31 downto 0); --  biss_reg(conv_integer(word_address));	            -- data from reg array
+                    position_h_reg <= ENCODER_STATUS & C_ZEROS(23 downto CDS_DATA'length+G_BISS_MAX_DATA_BITS+C_NUM_OF_LIFE_COUNTER-32 ) &CDS_DATA &ENCODER_LIFE_POSITION(5 downto 0) & ENCODER_POSITION(G_BISS_MAX_DATA_BITS-1 downto 32);
+                    enc_pos_h_lat_ena <= '1';
+                elsif (word_address = 3) then
+                    if enc_pos_h_lat_ena = '1' then
+                        data_out_reg <= position_h_reg;
+                    else
+                        data_out_reg <= ENCODER_STATUS & C_ZEROS(23 downto CDS_DATA'length+G_BISS_MAX_DATA_BITS+C_NUM_OF_LIFE_COUNTER-32) & CDS_DATA & ENCODER_LIFE_POSITION(5 downto 0) &ENCODER_POSITION(G_BISS_MAX_DATA_BITS-1 downto 32);
+                    end if;   
+                    enc_pos_h_lat_ena <= '0';
+                elsif (word_address = 4 ) then 
+                	data_out_reg <=  control_data_configuration_reg(31 downto 0);
+                elsif (word_address = 5 ) then
+                   data_out_reg<= reset_configuration_reg; 	             	
+                end if;
+            else
+                data_valid_reg <= '0';
+            end if;
+
+        end if;    
+    end process sw_read_proc; 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+    -- assignments
+    word_address        <=  AV_MM_ADDRESS(C_BISS_ENC_ADDR_WIDTH-1 downto 2);    -- getting the word address- ignoring the 2 lsb
+    --av_mm signals
+    AV_MM_READDATA      <=  data_out_reg  ;   
+    AV_MM_READDATAVALID <=  data_valid_reg; 
+    AV_MM_WAITREQUEST   <= '0';
+
+    --output to biss_enc_if module
+    RESOLUTION          <= biss_configuration_reg(5 downto 0);
+    MA_TO_CLK_RATIO     <= biss_configuration_reg(13 downto 6);
+    ACK_TIMEOUT_DELAY   <= biss_configuration_reg(21 downto 14);
+    END_TIMEOUT_DELAY   <= biss_configuration_reg(30 downto 22);
+    ENCODER_ENA         <= biss_configuration_reg(31);
+    CDM_ADDRESS         <= control_data_configuration_reg(6 downto 0);
+    CDM_DATA            <= control_data_configuration_reg(14 downto 7);
+    CDM_OPERATION       <= control_data_configuration_reg(16 downto 15);
+    RESET_EN            <=reset_configuration_reg(4 downto 0);
+    RESET_TIME_STATE    <=reset_configuration_reg(23 downto 8);
+    
+    
+
+end biss_enc_regs_arc;
